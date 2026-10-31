@@ -1,0 +1,2 @@
+https://github.com/earendil-works/pi-claude-code at 70abb65 (MIT, see LICENSE).
+Copied without tests and build files; pi loads src/index.ts through package.json.

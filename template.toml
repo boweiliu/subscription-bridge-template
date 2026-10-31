@@ -1,0 +1,36 @@
+# Machine-readable manifest for this template. The sibling
+# template.md holds the prose, the Requirements list, and the two
+# append-only history logs; this file is authoritative for everything
+# below. Both are generated together -- validate_template.py fails if
+# they disagree.
+format = "v2"
+
+[template]
+slug = "subscription-bridge"
+title = "Subscription Bridge"
+description = "Shared Claude subscription bridge and subscription manager for pi-dev chats"
+thumbnail = "template.svg"
+version = "v1"
+
+# How this template is DERIVED from the workspace it came from. An
+# update re-runs this recipe rather than diffing two repos, which is what
+# keeps an exclusion excluded even though the thing still exists upstream.
+[recipe]
+include = ["deploy/pi_subscriptions", "system/supervisord.conf.d/claude_subscription_bridge.conf", ".agents/skills/publish-app-bowei-style"]
+data_include = []
+exclude = []
+modification_rules = []
+
+[requirements]
+
+[requirements.llm]
+method = "keyless"
+note = "Runs against an existing Claude subscription via the local Claude CLI executable"
+
+[[requirements.adaptation]]
+summary = "Requires a signed-in Claude subscription on the host machine"
+resolution = "Run claude / sign in with a Claude Pro or Max subscription in the chat app or CLI"
+
+[environment]
+apt = []
+env_d_units = []

@@ -1,0 +1,631 @@
+diff --git a/system/apps/chat/imbue/chat/harnesses/pi_coding/model.py b/system/apps/chat/imbue/chat/harnesses/pi_coding/model.py
+index bd3fdfdf2..2d7c5cfca 100644
+--- a/system/apps/chat/imbue/chat/harnesses/pi_coding/model.py
++++ b/system/apps/chat/imbue/chat/harnesses/pi_coding/model.py
+@@ -11,7 +11,9 @@ and account-gated, so the picker is a search box, not a list).
+ The catalog is the master list: it supplies each model's effort levels (verbatim
+ strings from pi's data) and the label for whatever model an agent is on. Which models
+ are *offered* to a user is a separate, live concern (``pi --list-models`` for the
+-authed subset), handled at picker-open time, not here.
++authed subset), handled at picker-open time, not here. Models a pi extension adds at
++runtime are not in those data files; pi saves them in each agent's ``models-store.json``,
++and the catalog appends the ones whose provider pi-ai does not bundle (:func:`get_catalog`).
+ 
+ The live selection is read by the shared reader
+ (:func:`~imbue.chat.harnesses.model.read_model_identity`) from the uniform
+@@ -25,6 +27,8 @@ WRITE (switch) side and the auth-gated picker offer set (:meth:`list_offered_mod
+ import json
+ import os
+ import shutil
++import threading
++import time
+ from collections.abc import Callable
+ from enum import StrEnum
+ from pathlib import Path
+@@ -33,6 +37,7 @@ from typing import Any
+ from loguru import logger
+ 
+ from imbue.chat.agent_discovery import AgentInfo
++from imbue.chat.agent_discovery import get_host_dir
+ from imbue.chat.agent_discovery import start_agent
+ from imbue.chat.harnesses.interrupt import InterruptToComposer
+ from imbue.chat.harnesses.interrupt import IsCompactionInFlight
+@@ -58,6 +63,7 @@ from imbue.chat.harnesses.session import ShoulderTapOutcome
+ from imbue.chat.harnesses.session_watcher import AgentSessionWatcher
+ from imbue.concurrency_group.subprocess_utils import ProcessSetupError
+ from imbue.concurrency_group.subprocess_utils import run_local_command_modern_version
++from imbue.imbue_common.model_update import to_update
+ from imbue.mngr.errors import MngrError
+ from imbue.mngr.utils.file_utils import atomic_write
+ from imbue.mngr.utils.file_utils import read_json_dict
+@@ -164,8 +170,66 @@ def build_catalog(data_dir: Path) -> HarnessCatalog:
+             for model_id, model in models_by_id.items():
+                 if isinstance(model, dict):
+                     entries.append((f"{provider_id}/{model_id}", _supported_thinking_levels(model)))
++    return _catalog_from_entries(tuple(entries))
++
++
++# pi saves the models a provider discovers at runtime -- the ones a pi extension adds, like the
++# Claude Code add-on's ``claude-code/...`` -- in ``models-store.json`` in each pi config dir, shaped
++# ``{provider_id: {"models": [model, ...], ...}}`` with the same model fields as the bundled data.
++# Those providers are not in pi-ai's bundled data, so without them the catalog refuses their models
++# (at create and on the model bar) and the chip cannot label them. Every pi agent of this host has
++# its own config dir (``PI_CONFIG_DIR_RELPATH`` under its state dir), so the host's agents are where
++# those stores are: a model shows up once any pi agent here has run with the extension.
++_MODELS_STORE_NAME: str = "models-store.json"
++# How long a scan of the saved stores is reused before the stores are read again.
++_EXTENSION_RESCAN_SECONDS: float = 30.0
++# The last scan, by the agents dir it read: when it ran and what it found.
++_EXTENSION_SCANS: dict[Path, tuple[float, tuple[tuple[str, tuple[str, ...]], ...]]] = {}
++
++
++def _model_store_paths(agents_dir: Path) -> list[Path]:
++    """Every pi agent's saved model store under ``agents_dir``, in a stable order."""
++    return sorted(agents_dir.glob(f"*/{PI_CONFIG_DIR_RELPATH}/{_MODELS_STORE_NAME}"))
++
++
++def read_extension_entries(
++    store_paths: list[Path], bundled_providers: frozenset[str]
++) -> tuple[tuple[str, tuple[str, ...]], ...]:
++    """Catalog entries for the models saved in ``store_paths`` whose provider pi-ai does not bundle.
++
++    A bundled provider's saved models are left to its bundled data (the catalog's master list). The
++    first store to name a model decides its efforts; a malformed store or model is skipped.
++    """
++    entries: dict[str, tuple[str, ...]] = {}
++    for path in store_paths:
++        for provider_id, record in read_json_dict(path).items():
++            if provider_id in bundled_providers or not isinstance(record, dict):
++                continue
++            models = record.get("models")
++            if not isinstance(models, list):
++                continue
++            for model in models:
++                if isinstance(model, dict) and isinstance(model.get("id"), str) and model["id"]:
++                    entries.setdefault(f"{provider_id}/{model['id']}", _supported_thinking_levels(model))
++    return tuple(sorted(entries.items()))
++
++
++def _extension_entries(bundled_providers: frozenset[str]) -> tuple[tuple[str, tuple[str, ...]], ...]:
++    """``read_extension_entries`` over this host's stores, re-read at most every ``_EXTENSION_RESCAN_SECONDS``."""
++    agents_dir = get_host_dir() / "agents"
++    now = time.monotonic()
++    previous = _EXTENSION_SCANS.get(agents_dir)
++    if previous is not None and now - previous[0] < _EXTENSION_RESCAN_SECONDS:
++        return previous[1]
++    entries = read_extension_entries(_model_store_paths(agents_dir), bundled_providers)
++    _EXTENSION_SCANS.clear()
++    _EXTENSION_SCANS[agents_dir] = (now, entries)
++    return entries
++
++
++def _catalog_from_entries(entries: tuple[tuple[str, tuple[str, ...]], ...]) -> HarnessCatalog:
+     return HarnessCatalog(
+-        options=to_options(tuple(entries)),
++        options=to_options(entries),
+         # EAGER_THEN_RECONCILE: the mailbox consume is guaranteed (single-slot,
+         # rename-apply-delete) and switch() wakes a stopped agent, so an optimistic
+         # chip reconciles promptly; the picker is auth-filtered, so an eager pick
+@@ -181,6 +245,8 @@ def build_catalog(data_dir: Path) -> HarnessCatalog:
+ # Parsed catalogs by the provider data dir they were read from, so each pi on PATH is served its own models.
+ # An empty catalog is not stored, so a pi installed later is still read.
+ _CATALOG_BY_DATA_DIR: dict[Path, HarnessCatalog] = {}
++# The bundled catalog with the saved extension models added, by data dir and those models.
++_MERGED_CATALOGS: dict[tuple[Path, tuple[tuple[str, tuple[str, ...]], ...]], HarnessCatalog] = {}
+ 
+ 
+ def get_catalog() -> HarnessCatalog:
+@@ -197,13 +263,24 @@ def get_catalog() -> HarnessCatalog:
+             # pi interrupts natively via the lifecycle extension (interrupt + resubmit).
+             native_atomic_shoulder_tap_possible=True,
+         )
+-    cached = _CATALOG_BY_DATA_DIR.get(data_dir)
+-    if cached is not None:
+-        return cached
+-    catalog = build_catalog(data_dir)
+-    if catalog.options:
++    catalog = _CATALOG_BY_DATA_DIR.get(data_dir)
++    if catalog is None:
++        catalog = build_catalog(data_dir)
++        if not catalog.options:
++            return catalog
+         _CATALOG_BY_DATA_DIR[data_dir] = catalog
+-    return catalog
++    extensions = _extension_entries(frozenset(path.stem for path in data_dir.glob("*.json")))
++    if not extensions:
++        return catalog
++    merged = _MERGED_CATALOGS.get((data_dir, extensions))
++    if merged is None:
++        # One merged catalog per distinct extension set; a new set replaces the old ones.
++        _MERGED_CATALOGS.clear()
++        merged = catalog.model_copy_update(
++            to_update(catalog.field_ref().options, (*catalog.options, *to_options(extensions)))
++        )
++        _MERGED_CATALOGS[(data_dir, extensions)] = merged
++    return merged
+ 
+ 
+ class PiModelResolver(HarnessModelResolver):
+@@ -271,6 +348,13 @@ class PiModelResolver(HarnessModelResolver):
+         except OSError as e:
+             logger.warning("pi switch: failed to write control file {}: {}", control_path, e)
+             return SwitchResult(ok=False, detail="Failed to record the model switch")
++        if ModelAxis.MODEL in axes and identity.effort:
++            threading.Thread(
++                target=reapply_effort_after_model_switch,
++                args=(self._state_dir, intent),
++                name=f"pi-effort-reapply-{self._agent_name}",
++                daemon=True,
++            ).start()
+         # Wake a stopped agent so the parked intent applies now instead of at some future
+         # start -- matching claude/codex, whose send-delivered switches auto-start. Written
+         # AFTER the mailbox so the extension's session-start consume sees the intent. The
+@@ -287,6 +371,47 @@ class PiModelResolver(HarnessModelResolver):
+         return SwitchResult(ok=True)
+ 
+ 
++# How long the effort re-apply below waits for pi to take up the model, and how often it looks.
++_REAPPLY_WAIT_SECONDS: float = 60.0
++_REAPPLY_POLL_SECONDS: float = 0.5
++
++
++def reapply_effort_after_model_switch(
++    state_dir: Path,
++    intent: dict[str, Any],
++    wait_seconds: float = _REAPPLY_WAIT_SECONDS,
++    poll_seconds: float = _REAPPLY_POLL_SECONDS,
++) -> bool:
++    """Send a model-and-effort switch once more when the model landed but the effort did not.
++
++    mngr's pi lifecycle extension applies a switch's effort BEFORE its model, and pi moves the
++    effort to one the new model has as the model changes: a chat moved to opencode-go/glm-5.3 at
++    "low" (GLM-5.3 offers low, high, max) ends on "high". With the model already in place, the
++    same intent again changes only the effort, which then holds. Waits for the first intent to be
++    consumed and for ``model_state.json`` to show the model; returns whether it re-sent.
++    """
++    control_path = state_dir / _CONTROL_NAME
++    deadline = time.monotonic() + wait_seconds
++    # Nothing signals when pi consumes the mailbox, so this polls; the event is never set.
++    never_set = threading.Event()
++    while time.monotonic() < deadline:
++        never_set.wait(timeout=poll_seconds)
++        if control_path.exists():
++            continue
++        state = read_json_dict(state_dir / "model_state.json")
++        if state.get("model") != intent["model_id"]:
++            continue
++        if state.get("effort") == intent["thinking_level"]:
++            return False
++        try:
++            atomic_write(control_path, json.dumps(intent))
++        except OSError as e:
++            logger.warning("pi switch: failed to re-send the effort to {}: {}", control_path, e)
++            return False
++        return True
++    return False
++
++
+ class PiFlushTapStatus(StrEnum):
+     """The atomic flush writer's outcome; the server maps it to an HTTP response.
+ 
+diff --git a/system/apps/chat/imbue/chat/harnesses/pi_coding/model_test.py b/system/apps/chat/imbue/chat/harnesses/pi_coding/model_test.py
+index 6fcb71282..ac548519a 100644
+--- a/system/apps/chat/imbue/chat/harnesses/pi_coding/model_test.py
++++ b/system/apps/chat/imbue/chat/harnesses/pi_coding/model_test.py
+@@ -1,6 +1,7 @@
+ """Unit tests for pi's parsed catalog, its model resolver, and the locked flush writer."""
+ 
+ import json
++import threading
+ from pathlib import Path
+ from typing import Any
+ 
+@@ -15,12 +16,20 @@ from imbue.chat.harnesses.model import PickerMode
+ from imbue.chat.harnesses.model import SwitchMode
+ from imbue.chat.harnesses.pi_coding.model import PiFlushTapStatus
+ from imbue.chat.harnesses.pi_coding.model import PiModelResolver
++from imbue.chat.harnesses.pi_coding.model import _EXTENSION_RESCAN_SECONDS
++from imbue.chat.harnesses.pi_coding.model import _EXTENSION_SCANS
++from imbue.chat.harnesses.pi_coding.model import _MERGED_CATALOGS
+ from imbue.chat.harnesses.pi_coding.model import _parse_list_models
+ from imbue.chat.harnesses.pi_coding.model import _supported_thinking_levels
+ from imbue.chat.harnesses.pi_coding.model import build_catalog
+ from imbue.chat.harnesses.pi_coding.model import flush_pi_queue_atomic
++from imbue.chat.harnesses.pi_coding.model import read_extension_entries
++from imbue.chat.harnesses.pi_coding.model import reapply_effort_after_model_switch
+ from imbue.chat.harnesses.registry import get_catalog
+ from imbue.chat.testing import put_stand_in_pi_on_path
++from imbue.chat.testing import wait_until_true
++
++_TESTDATA = Path(__file__).parent / "testdata"
+ 
+ 
+ def _agent_info(tmp_path: Path) -> AgentInfo:
+@@ -187,3 +196,212 @@ def test_flush_appends_the_sentinel_when_no_send_is_in_flight(tmp_path: Path) ->
+     status = flush_pi_queue_atomic(tmp_path)
+     assert status == PiFlushTapStatus.TAPPED
+     assert (tmp_path / "pi_inbox").read_text().splitlines() == ['{"minds_interrupt": true}']
++
++
++# models a pi extension adds (saved by pi in each agent's models-store.json)
++
++_ADAPTIVE = {
++    "off": None,
++    "minimal": None,
++    "low": "low",
++    "medium": "medium",
++    "high": "high",
++    "xhigh": "xhigh",
++    "max": "max",
++}
++
++
++def _write_store(path: Path, store: dict[str, Any]) -> Path:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(json.dumps(store))
++    return path
++
++
++def test_extension_entries_take_saved_models_of_providers_pi_does_not_bundle(tmp_path: Path) -> None:
++    first = _write_store(
++        tmp_path / "a" / "models-store.json",
++        {
++            "claude-code": {
++                "models": [
++                    {"id": "claude-opus-5-5", "reasoning": True, "thinkingLevelMap": _ADAPTIVE},
++                    {"id": "", "reasoning": True},
++                    "not a model",
++                ],
++                "checkedAt": 1,
++            },
++            # A bundled provider's saved models are its bundled data's business.
++            "openrouter": {"models": [{"id": "vendor/x", "reasoning": False}]},
++            "broken": "not a record",
++        },
++    )
++    second = _write_store(
++        tmp_path / "b" / "models-store.json",
++        {
++            "claude-code": {
++                "models": [
++                    # The first store to name a model decides its efforts.
++                    {"id": "claude-opus-5-5", "reasoning": False},
++                    {"id": "claude-haiku-5-5", "reasoning": False},
++                ]
++            },
++        },
++    )
++    malformed = tmp_path / "c" / "models-store.json"
++    malformed.parent.mkdir()
++    malformed.write_text("{not json")
++    entries = read_extension_entries([first, second, malformed, tmp_path / "missing.json"], frozenset({"openrouter"}))
++    assert entries == (
++        ("claude-code/claude-haiku-5-5", ("off",)),
++        ("claude-code/claude-opus-5-5", ("low", "medium", "high", "xhigh", "max")),
++    )
++
++
++def test_the_pi_catalog_offers_models_an_extension_saved_in_an_agents_store(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    put_stand_in_pi_on_path(tmp_path / "pi", "openrouter", ["vendor/first-model"], monkeypatch)
++    host_dir = tmp_path / "host"
++    monkeypatch.setenv("MNGR_HOST_DIR", str(host_dir))
++    _write_store(
++        host_dir / "agents" / "agent-1" / "plugin" / "pi_coding" / "models-store.json",
++        {
++            "claude-code": {"models": [{"id": "claude-opus-5-5", "reasoning": True, "thinkingLevelMap": _ADAPTIVE}]},
++        },
++    )
++    options = get_catalog(HarnessType.PI_CODING).options
++    assert [option.id for option in options] == ["openrouter/vendor/first-model", "claude-code/claude-opus-5-5"]
++    assert [effort.level for effort in options[1].efforts] == ["low", "medium", "high", "xhigh", "max"]
++
++
++def test_a_saved_claude_code_store_gives_its_models_with_their_efforts() -> None:
++    # Trimmed from the store pi saved for a Claude-subscription agent running the Claude Code add-on:
++    # an adaptive model (off/minimal nulled), one offering only xhigh and max, and one whose map
++    # leaves off and minimal on.
++    entries = read_extension_entries([_TESTDATA / "models_store_claude_code.json"], frozenset({"anthropic"}))
++    assert entries == (
++        ("claude-code/claude-fable-5-1", ("minimal", "low", "medium", "high", "xhigh", "max")),
++        ("claude-code/claude-opus-5-5", ("low", "medium", "high", "xhigh", "max")),
++        ("claude-code/claude-sonnet-5-5", ("off", "minimal", "low", "medium", "high", "xhigh", "max")),
++    )
++
++
++def _agent_store(host_dir: Path, agent_id: str) -> Path:
++    return host_dir / "agents" / agent_id / "plugin" / "pi_coding" / "models-store.json"
++
++
++def test_the_pi_catalog_leaves_a_bundled_providers_saved_models_to_its_bundled_data(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    put_stand_in_pi_on_path(tmp_path / "pi", "openrouter", ["vendor/first-model"], monkeypatch)
++    host_dir = tmp_path / "host"
++    monkeypatch.setenv("MNGR_HOST_DIR", str(host_dir))
++    bundled = get_catalog(HarnessType.PI_CODING)
++    _write_store(
++        _agent_store(host_dir, "agent-1"),
++        {"openrouter": {"models": [{"id": "vendor/discovered", "reasoning": False}]}},
++    )
++    _age_extension_scan(host_dir / "agents")
++    # Nothing to add: the very catalog read from pi's bundled data, unchanged.
++    assert get_catalog(HarnessType.PI_CODING) is bundled
++    assert [option.id for option in bundled.options] == ["openrouter/vendor/first-model"]
++
++
++def test_an_extension_model_saved_after_a_scan_is_offered_once_the_rescan_window_passes(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    put_stand_in_pi_on_path(tmp_path / "pi", "openrouter", ["vendor/first-model"], monkeypatch)
++    host_dir = tmp_path / "host"
++    monkeypatch.setenv("MNGR_HOST_DIR", str(host_dir))
++    assert [option.id for option in get_catalog(HarnessType.PI_CODING).options] == ["openrouter/vendor/first-model"]
++    _write_store(
++        _agent_store(host_dir, "agent-1"),
++        {"claude-code": {"models": [{"id": "claude-opus-5-5", "reasoning": True, "thinkingLevelMap": _ADAPTIVE}]}},
++    )
++    # Within the window the last scan stands.
++    assert [option.id for option in get_catalog(HarnessType.PI_CODING).options] == ["openrouter/vendor/first-model"]
++    _age_extension_scan(host_dir / "agents")
++    merged = get_catalog(HarnessType.PI_CODING)
++    assert [option.id for option in merged.options] == ["openrouter/vendor/first-model", "claude-code/claude-opus-5-5"]
++    assert get_catalog(HarnessType.PI_CODING) is merged
++    # A second agent's store adds its models; the merged catalog for the old set is dropped.
++    _write_store(
++        _agent_store(host_dir, "agent-2"),
++        {"claude-code": {"models": [{"id": "claude-haiku-5-5", "reasoning": False}]}},
++    )
++    _age_extension_scan(host_dir / "agents")
++    assert [option.id for option in get_catalog(HarnessType.PI_CODING).options] == [
++        "openrouter/vendor/first-model",
++        "claude-code/claude-haiku-5-5",
++        "claude-code/claude-opus-5-5",
++    ]
++    assert len(_MERGED_CATALOGS) == 1
++    assert len(_EXTENSION_SCANS) == 1
++
++
++def _age_extension_scan(agents_dir: Path) -> None:
++    scanned_at, entries = _EXTENSION_SCANS[agents_dir]
++    _EXTENSION_SCANS[agents_dir] = (scanned_at - _EXTENSION_RESCAN_SECONDS - 1, entries)
++
++
++def _write_model_state(state_dir: Path, model: str, effort: str) -> None:
++    (state_dir / "model_state.json").write_text(json.dumps({"model": model, "effort": effort, "fast": False}))
++
++
++def test_effort_is_sent_again_when_the_model_switch_moved_it(tmp_path: Path) -> None:
++    # pi took the model but moved the effort ("low" asked, "high" landed): the intent goes again.
++    intent = {"model_id": "opencode-go/glm-5.3", "thinking_level": "low"}
++    _write_model_state(tmp_path, "opencode-go/glm-5.3", "high")
++    assert reapply_effort_after_model_switch(tmp_path, intent, wait_seconds=2, poll_seconds=0.01)
++    assert json.loads((tmp_path / "pi_control.json").read_text()) == intent
++
++
++def test_effort_is_not_sent_again_when_it_landed_or_the_model_never_did(tmp_path: Path) -> None:
++    intent = {"model_id": "opencode-go/glm-5.3", "thinking_level": "low"}
++    _write_model_state(tmp_path, "opencode-go/glm-5.3", "low")
++    assert not reapply_effort_after_model_switch(tmp_path, intent, wait_seconds=2, poll_seconds=0.01)
++    _write_model_state(tmp_path, "openrouter/vendor/other", "high")
++    assert not reapply_effort_after_model_switch(tmp_path, intent, wait_seconds=0.1, poll_seconds=0.01)
++    # An intent pi has not consumed yet is never overwritten.
++    (tmp_path / "pi_control.json").write_text(json.dumps({"model_id": "x/newer", "thinking_level": None}))
++    _write_model_state(tmp_path, "opencode-go/glm-5.3", "high")
++    assert not reapply_effort_after_model_switch(tmp_path, intent, wait_seconds=0.1, poll_seconds=0.01)
++    assert json.loads((tmp_path / "pi_control.json").read_text())["model_id"] == "x/newer"
++
++
++def _reapply_threads() -> set[threading.Thread]:
++    return {thread for thread in threading.enumerate() if thread.name.startswith("pi-effort-reapply-")}
++
++
++def test_a_model_switch_sends_its_effort_again_once_pi_has_moved_it(tmp_path: Path) -> None:
++    resolver = PiModelResolver.build(_agent_info(tmp_path), start_agent_fn=lambda name: None)
++    result = resolver.switch(
++        ModelIdentity(model_id="opencode-go/glm-5.3", effort="low", fast=False),
++        frozenset({ModelAxis.MODEL, ModelAxis.EFFORT}),
++        lambda line: True,
++    )
++    assert result.ok
++    control_path = tmp_path / "pi_control.json"
++    # pi consumes the intent, takes the model, and lands on an effort GLM-5.3 has but was not asked for.
++    control_path.unlink()
++    _write_model_state(tmp_path, "opencode-go/glm-5.3", "high")
++    wait_until_true(control_path.exists, timeout_seconds=5, what="the effort re-send")
++    assert json.loads(control_path.read_text()) == {"model_id": "opencode-go/glm-5.3", "thinking_level": "low"}
++
++
++@pytest.mark.parametrize(
++    ("effort", "axes"),
++    [
++        ("low", frozenset({ModelAxis.EFFORT})),
++        (None, frozenset({ModelAxis.MODEL})),
++    ],
++    ids=["effort-only", "model-without-effort"],
++)
++def test_a_switch_without_both_a_model_and_an_effort_sends_nothing_again(
++    tmp_path: Path, effort: str | None, axes: frozenset[ModelAxis]
++) -> None:
++    before = _reapply_threads()
++    resolver = PiModelResolver.build(_agent_info(tmp_path), start_agent_fn=lambda name: None)
++    assert resolver.switch(
++        ModelIdentity(model_id="opencode-go/glm-5.3", effort=effort, fast=False), axes, lambda line: True
++    ).ok
++    assert _reapply_threads() <= before
+diff --git a/system/apps/chat/imbue/chat/harnesses/pi_coding/testdata/models_store_claude_code.json b/system/apps/chat/imbue/chat/harnesses/pi_coding/testdata/models_store_claude_code.json
+new file mode 100644
+index 000000000..4ec025b6e
+--- /dev/null
++++ b/system/apps/chat/imbue/chat/harnesses/pi_coding/testdata/models_store_claude_code.json
+@@ -0,0 +1,120 @@
++{
++  "claude-code": {
++    "models": [
++      {
++        "id": "claude-opus-5-5",
++        "name": "Claude Opus 5.5",
++        "reasoning": true,
++        "input": [
++          "text",
++          "image"
++        ],
++        "cost": {
++          "input": 4,
++          "output": 20,
++          "cacheRead": 0.2,
++          "cacheWrite": 5
++        },
++        "contextWindow": 1000000,
++        "maxTokens": 128000,
++        "thinkingLevelMap": {
++          "off": null,
++          "minimal": null,
++          "low": "low",
++          "medium": "medium",
++          "high": "high",
++          "xhigh": "xhigh",
++          "max": "max"
++        },
++        "promptCache": {
++          "short": 300,
++          "long": 3600
++        },
++        "inputLimits": {
++          "maxRequestBytes": 33554432,
++          "images": {
++            "maxPerRequest": 600,
++            "resize": {
++              "maxWidth": 2000,
++              "maxHeight": 2000,
++              "maxBytes": 4718592,
++              "jpegQuality": 80
++            }
++          }
++        },
++        "api": "claude-code-stream-json",
++        "provider": "claude-code",
++        "baseUrl": "process://claude-code"
++      },
++      {
++        "id": "claude-fable-5-1",
++        "name": "Claude Fable 5.1",
++        "reasoning": true,
++        "input": [
++          "text",
++          "image"
++        ],
++        "cost": {
++          "input": 10,
++          "output": 50,
++          "cacheRead": 0.25,
++          "cacheWrite": 12.5
++        },
++        "contextWindow": 1000000,
++        "maxTokens": 128000,
++        "thinkingLevelMap": {
++          "off": null,
++          "xhigh": "xhigh",
++          "max": "max"
++        },
++        "promptCache": {
++          "short": 300,
++          "long": 3600
++        },
++        "inputLimits": {
++          "maxRequestBytes": 33554432,
++          "images": {
++            "maxPerRequest": 600,
++            "resize": {
++              "maxWidth": 2000,
++              "maxHeight": 2000,
++              "maxBytes": 4718592,
++              "jpegQuality": 80
++            }
++          }
++        },
++        "api": "claude-code-stream-json",
++        "provider": "claude-code",
++        "baseUrl": "process://claude-code"
++      },
++      {
++        "id": "claude-sonnet-5-5",
++        "name": "Sonnet (Claude Code)",
++        "api": "claude-code-stream-json",
++        "provider": "claude-code",
++        "baseUrl": "process://claude-code",
++        "reasoning": true,
++        "thinkingLevelMap": {
++          "low": "low",
++          "medium": "medium",
++          "high": "high",
++          "xhigh": "xhigh",
++          "max": "max"
++        },
++        "input": [
++          "text",
++          "image"
++        ],
++        "cost": {
++          "input": 0,
++          "output": 0,
++          "cacheRead": 0,
++          "cacheWrite": 0
++        },
++        "contextWindow": 200000,
++        "maxTokens": 64000
++      }
++    ],
++    "checkedAt": 1793405924363
++  }
++}
+diff --git a/system/apps/chat/imbue/chat/server_test.py b/system/apps/chat/imbue/chat/server_test.py
+index cd89fe6a0..aeb36b5a3 100644
+--- a/system/apps/chat/imbue/chat/server_test.py
++++ b/system/apps/chat/imbue/chat/server_test.py
+@@ -118,6 +118,7 @@ from imbue.chat.testing import make_chat_handoff_record
+ from imbue.chat.testing import make_chat_rebind_record
+ from imbue.chat.testing import make_two_member_chat_record
+ from imbue.chat.testing import open_ws
++from imbue.chat.testing import put_stand_in_pi_on_path
+ from imbue.chat.testing import seed_agent_state
+ from imbue.chat.testing import seed_failed_chat
+ from imbue.chat.testing import serve_app
+@@ -1776,6 +1777,36 @@ def test_get_harnesses_lists_the_claude_catalog(client: FlaskClient) -> None:
+     assert claude["powered_by_text"] == ""
+ 
+ 
++def test_get_harnesses_lists_a_model_a_pi_extension_saved_with_its_efforts(
++    client: FlaskClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """A model a pi extension adds (saved in an agent's ``models-store.json``) is in pi's served catalog, so the
++    picker can offer it and the chip can label it."""
++    put_stand_in_pi_on_path(tmp_path / "pi", "openrouter", ["vendor/first-model"], monkeypatch)
++    store = Path(os.environ["MNGR_HOST_DIR"]) / "agents" / "agent-1" / "plugin" / "pi_coding" / "models-store.json"
++    store.parent.mkdir(parents=True)
++    store.write_text(
++        json.dumps(
++            {
++                "claude-code": {
++                    "models": [
++                        {
++                            "id": "claude-opus-5-5",
++                            "reasoning": True,
++                            "thinkingLevelMap": {"off": None, "minimal": None},
++                        }
++                    ]
++                }
++            }
++        )
++    )
++    pi = client.get("/api/harnesses").get_json()["pi-coding"]
++    by_id = {option["id"]: option for option in pi["options"]}
++    assert list(by_id) == ["openrouter/vendor/first-model", "claude-code/claude-opus-5-5"]
++    assert by_id["claude-code/claude-opus-5-5"]["label"] == "claude-code/claude-opus-5-5"
++    assert [effort["level"] for effort in by_id["claude-code/claude-opus-5-5"]["efforts"]] == ["low", "medium", "high"]
++
++
+ def test_get_harnesses_says_which_harnesses_compact_and_whose_interrupt_cancels_a_compaction(
+     client: FlaskClient,
+ ) -> None:

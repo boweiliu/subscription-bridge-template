@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 160" width="100%" height="100%" role="img" aria-label="Subscription Bridge">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#1e293b"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#818cf8"/>
+    </linearGradient>
+  </defs>
+  <rect width="240" height="160" rx="16" fill="url(#bg)"/>
+  <!-- Status pill -->
+  <rect x="24" y="22" width="76" height="18" rx="9" fill="#334155"/>
+  <circle cx="33" cy="31" r="3.5" fill="#10b981"/>
+  <text x="42" y="34.5" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="9" font-weight="600" fill="#94a3b8">SHARED</text>
+  <!-- Port tag -->
+  <text x="180" y="34.5" font-family="ui-monospace,SFMono-Regular,monospace" font-size="9" font-weight="600" fill="#64748b">:3456</text>
+  <!-- Bridge Arch Illustration -->
+  <path d="M 32 110 Q 120 45 208 110" fill="none" stroke="url(#accent)" stroke-width="4" stroke-linecap="round"/>
+  <path d="M 32 110 L 208 110" fill="none" stroke="#475569" stroke-width="2" stroke-linecap="round"/>
+  <!-- Vertical suspension cables -->
+  <line x1="68" y1="91" x2="68" y2="110" stroke="#475569" stroke-width="1.5" stroke-dasharray="2 2"/>
+  <line x1="96" y1="78" x2="96" y2="110" stroke="#475569" stroke-width="1.5" stroke-dasharray="2 2"/>
+  <line x1="120" y1="74" x2="120" y2="110" stroke="#475569" stroke-width="1.5" stroke-dasharray="2 2"/>
+  <line x1="144" y1="78" x2="144" y2="110" stroke="#475569" stroke-width="1.5" stroke-dasharray="2 2"/>
+  <line x1="172" y1="91" x2="172" y2="110" stroke="#475569" stroke-width="1.5" stroke-dasharray="2 2"/>
+  <!-- Node endpoints -->
+  <circle cx="32" cy="110" r="5" fill="#38bdf8"/>
+  <circle cx="208" cy="110" r="5" fill="#818cf8"/>
+  <!-- Labels -->
+  <text x="32" y="126" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="8" font-weight="600" fill="#94a3b8" text-anchor="middle">pi-dev</text>
+  <text x="208" y="126" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="8" font-weight="600" fill="#94a3b8" text-anchor="middle">claude sub</text>
+  <!-- Title -->
+  <text x="24" y="146" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="12" font-weight="700" fill="#f8fafc">Subscription Bridge</text>
+</svg>

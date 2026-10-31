@@ -1,0 +1,8 @@
+https://github.com/rynfar/meridian plugin/pi + plugin/priority-attestation.ts, as shipped in
+@rynfar/meridian 1.87.0 (MIT, per its package.json). index.ts is the entry point `meridian setup
+--client pi` writes. Copied by hand because that setup refuses pi before 1.0 (this machine runs
+0.87.1, whose extension API the add-on works with).
+
+Local changes, marked "Local change" in the source:
+- pi/index.ts: no built-in fallback key; only a pi account holding a "meridian" credential offers it.
+- pi/catalog.ts: Claude 5 models pi does not know get a 128k output limit instead of 8k.
