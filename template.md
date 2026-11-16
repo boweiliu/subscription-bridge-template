@@ -2,7 +2,7 @@
 title: "Subscription Bridge"
 description: "Shared Claude subscription bridge and subscription manager for pi-dev chats"
 thumbnail: "template.svg"
-version: v1
+version: v2
 format: v2
 ---
 
@@ -103,6 +103,7 @@ appends one entry per version (newest last); earlier entries are never rewritten
 This is distinct from "Adaptation history" below, which is the ADOPTERS' log.
 
 ### v1 (2026-10-31) -- Initial release of the shared Claude subscription bridge for pi-dev
+### v2 (2026-11-14) -- The bridge no longer appends a growing "Files changed:" list to pi chat replies (MERIDIAN_NO_FILE_CHANGES=1)
 
 ## Adaptation history
 

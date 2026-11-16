@@ -46,6 +46,9 @@ export MERIDIAN_MAX_CONCURRENT="${MERIDIAN_MAX_CONCURRENT:-3}"
 # Never refresh or rewrite the Claude login: the claude program (here and in Claude chats) does that,
 # and refresh tokens are single-use, so a second refresher could sign the machine out.
 export MERIDIAN_CREDENTIALS_READONLY=1
+# Do not append a "Files changed:" list to replies. Meridian builds it from every shell redirect in
+# the whole conversation, so in pi chats it grows each turn and is mostly /tmp scratch files.
+export MERIDIAN_NO_FILE_CHANGES=1
 # Do not let inherited API credentials silently move turns off the subscription.
 unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL
 exec "$BRIDGE_HOME/node_modules/.bin/meridian"
